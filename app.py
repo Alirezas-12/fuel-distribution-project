@@ -1,0 +1,117 @@
+import streamlit as st
+import pandas as pd
+from fuel_lp_module import FuelDistributionLP
+from fuel_ga_module import FuelDistributionGA
+
+st.set_page_config(page_title="سیستم پخش فرآورده‌های نفتی", layout="wide")
+st.title("سیستم پخش فرآورده‌های نفتی و جایگاه‌های سوخت")
+
+tab1, tab2 = st.tabs(["ماژول LP - ارسال به انبار", "ماژول GA - زمان‌بندی توزیع"])
+
+# ---------------- تب ۱: ماژول LP ----------------
+with tab1:
+    st.subheader("ظرفیت عرضه پالایشگاه‌ها")
+    supply_df = st.data_editor(
+        pd.DataFrame({"پالایشگاه": ["R1", "R2"], "ظرفیت عرضه": [1000, 800]}),
+        num_rows="dynamic", key="supply_editor",
+    )
+
+    st.subheader("تقاضای انبارهای استانی")
+    demand_df = st.data_editor(
+        pd.DataFrame({"انبار": ["D1", "D2", "D3"], "تقاضا": [500, 600, 400]}),
+        num_rows="dynamic", key="demand_editor",
+    )
+
+    st.subheader("مسیرها (هزینه و ظرفیت هر مسیر)")
+    routes_df = st.data_editor(
+        pd.DataFrame({
+            "پالایشگاه": ["R1", "R1", "R1", "R2", "R2", "R2"],
+            "انبار": ["D1", "D2", "D3", "D1", "D2", "D3"],
+            "حالت حمل": ["pipeline", "pipeline", "rail", "rail", "pipeline", "pipeline"],
+            "هزینه واحد": [2, 3, 5, 4, 2, 3],
+            "ظرفیت مسیر": [700, 700, 700, 700, 700, 700],
+        }),
+        num_rows="dynamic", key="routes_editor",
+    )
+
+    if st.button("حل مسئله LP", key="run_lp"):
+        refineries = supply_df["پالایشگاه"].tolist()
+        depots = demand_df["انبار"].tolist()
+
+        lp = FuelDistributionLP(refineries=refineries, depots=depots)
+        lp.set_supply(dict(zip(supply_df["پالایشگاه"], supply_df["ظرفیت عرضه"])))
+        lp.set_demand(dict(zip(demand_df["انبار"], demand_df["تقاضا"])))
+
+        cost_dict, cap_dict = {}, {}
+        for _, row in routes_df.iterrows():
+            key = (row["پالایشگاه"], row["انبار"], row["حالت حمل"])
+            cost_dict[key] = row["هزینه واحد"]
+            cap_dict[key] = row["ظرفیت مسیر"]
+        lp.set_cost(cost_dict)
+        lp.set_capacity(cap_dict)
+
+        lp.build_model()
+        result = lp.solve()
+
+        if result["status"] == "Optimal":
+            st.success(f"وضعیت: {result['status']} | هزینه کل بهینه: {result['objective']}")
+
+            ship_df = pd.DataFrame([
+                {"مسیر": f"{i} -> {j} ({m})", "مقدار": v}
+                for (i, j, m), v in result["shipments"].items()
+            ])
+            st.dataframe(ship_df, use_container_width=True)
+            st.bar_chart(ship_df.set_index("مسیر"))
+
+            st.subheader("ارزش‌های سایه‌ای (تحلیل حساسیت)")
+            shadow_df = pd.DataFrame([
+                {"قید": name, "ارزش سایه‌ای": v}
+                for name, v in result["shadow_prices"].items()
+            ])
+            st.dataframe(shadow_df, use_container_width=True)
+        else:
+            st.error(f"وضعیت حل: {result['status']} — مسئله شدنی نیست، پارامترها رو چک کن")
+
+# ---------------- تب ۲: ماژول GA ----------------
+with tab2:
+    st.subheader("جایگاه‌های سوخت")
+    stations_df = st.data_editor(
+        pd.DataFrame({
+            "جایگاه": ["S0", "S1", "S2", "S3", "S4"],
+            "حجم (q)": [500, 300, 400, 600, 200],
+            "زمان سرویس (p)": [30, 20, 25, 35, 15],
+            "ددلاین (d)": [120, 90, 150, 100, 200],
+            "زمان آماده (r)": [0, 0, 0, 0, 0],
+        }),
+        num_rows="dynamic", key="stations_editor",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        num_tankers = st.number_input("تعداد تانکر", min_value=1, value=2, step=1)
+    with col2:
+        tanker_capacity = st.number_input("ظرفیت هر تانکر", min_value=1, value=1200, step=50)
+
+    if st.button("اجرای الگوریتم ژنتیک", key="run_ga"):
+        renamed = stations_df.rename(columns={
+            "حجم (q)": "q", "زمان سرویس (p)": "p", "ددلاین (d)": "d", "زمان آماده (r)": "r",
+        })
+        stations = renamed.to_dict("records")
+
+        ga = FuelDistributionGA(
+            stations=stations, num_tankers=int(num_tankers), tanker_capacity=tanker_capacity
+        )
+        best_chromo, best_fit = ga.run()
+
+        st.success(f"بهترین مجموع دیرکرد: {best_fit}")
+
+        schedule = ga.get_schedule(best_chromo)
+        result_df = pd.DataFrame(schedule)
+        result_df["جایگاه"] = result_df["station_index"].apply(
+            lambda idx: stations_df.iloc[idx]["جایگاه"]
+        )
+        result_df = result_df[["tanker", "جایگاه", "start", "finish", "deadline", "tardiness"]]
+        result_df.columns = ["تانکر", "جایگاه", "شروع", "پایان", "ددلاین", "دیرکرد"]
+
+        st.dataframe(result_df, use_container_width=True)
+        st.bar_chart(result_df.set_index("جایگاه")["دیرکرد"])
