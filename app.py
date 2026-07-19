@@ -1,12 +1,15 @@
 import streamlit as st
 import pandas as pd
+from groq import Groq
 from fuel_lp_module import FuelDistributionLP
 from fuel_ga_module import FuelDistributionGA
 
 st.set_page_config(page_title="سیستم پخش فرآورده‌های نفتی", layout="wide")
 st.title("سیستم پخش فرآورده‌های نفتی و جایگاه‌های سوخت")
 
-tab1, tab2 = st.tabs(["ماژول LP - ارسال به انبار", "ماژول GA - زمان‌بندی توزیع"])
+tab1, tab2, tab3 = st.tabs(
+    ["ماژول LP - ارسال به انبار", "ماژول GA - زمان‌بندی توزیع", "چت‌بات تحلیلی"]
+)
 
 # ---------------- تب ۱: ماژول LP ----------------
 with tab1:
@@ -54,6 +57,7 @@ with tab1:
         result = lp.solve()
 
         if result["status"] == "Optimal":
+            st.session_state["lp_result"] = result
             st.success(f"وضعیت: {result['status']} | هزینه کل بهینه: {result['objective']}")
 
             ship_df = pd.DataFrame([
@@ -103,8 +107,6 @@ with tab2:
         )
         best_chromo, best_fit = ga.run()
 
-        st.success(f"بهترین مجموع دیرکرد: {best_fit}")
-
         schedule = ga.get_schedule(best_chromo)
         result_df = pd.DataFrame(schedule)
         result_df["جایگاه"] = result_df["station_index"].apply(
@@ -113,5 +115,62 @@ with tab2:
         result_df = result_df[["tanker", "جایگاه", "start", "finish", "deadline", "tardiness"]]
         result_df.columns = ["تانکر", "جایگاه", "شروع", "پایان", "ددلاین", "دیرکرد"]
 
+        st.session_state["ga_result"] = {
+            "بهترین_دیرکرد_کل": best_fit,
+            "جدول_زمان‌بندی": result_df.to_dict("records"),
+        }
+        st.success(f"بهترین مجموع دیرکرد: {best_fit}")
         st.dataframe(result_df, use_container_width=True)
         st.bar_chart(result_df.set_index("جایگاه")["دیرکرد"])
+
+# ---------------- تب ۳: چت‌بات تحلیلی ----------------
+with tab3:
+    st.subheader("از نتایج بپرس")
+
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+
+    for msg in st.session_state["chat_history"]:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
+    user_question = st.chat_input("مثلاً: چرا این مسیر انتخاب شد؟ یا: اگه تقاضای D2 بیشتر بشه چی میشه؟")
+
+    if user_question:
+        st.session_state["chat_history"].append({"role": "user", "content": user_question})
+        with st.chat_message("user"):
+            st.write(user_question)
+
+        context_parts = []
+        if "lp_result" in st.session_state:
+            context_parts.append(f"نتیجه ماژول LP: {st.session_state['lp_result']}")
+        if "ga_result" in st.session_state:
+            context_parts.append(f"نتیجه ماژول GA: {st.session_state['ga_result']}")
+        if not context_parts:
+            context_parts.append("هنوز هیچ مسئله‌ای (نه LP و نه GA) حل نشده.")
+        context = "\n".join(context_parts)
+
+        system_prompt = (
+            "تو دستیار تحلیلی یک سیستم بهینه‌سازی پخش فرآورده‌های نفتی هستی. "
+            "بر اساس داده‌های زیر که از حل واقعی مسئله به‌دست اومده، کوتاه و دقیق "
+            "به سوال کاربر درباره پارامترها، دلیل بهینگی، تحلیل حساسیت یا پیشنهاد مدیریتی جواب بده:\n"
+            f"{context}"
+        )
+
+        with st.chat_message("assistant"):
+            with st.spinner("در حال فکر کردن..."):
+                try:
+                    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+                    response = client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_question},
+                        ],
+                    )
+                    answer = response.choices[0].message.content
+                except Exception as e:
+                    answer = f"خطا در اتصال به چت‌بات: {e}"
+                st.write(answer)
+
+        st.session_state["chat_history"].append({"role": "assistant", "content": answer})
